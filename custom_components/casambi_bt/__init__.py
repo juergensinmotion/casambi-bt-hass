@@ -1,12 +1,12 @@
 """The Casambi Bluetooth integration."""
-
+ 
 import asyncio
 from collections.abc import Callable, Iterable
 import inspect
 import logging
 from pathlib import Path
 from typing import Any, Final, cast
-
+ 
 from CasambiBt import Casambi, Group, Scene, Unit, UnitControlType
 from CasambiBt.errors import (
     AuthenticationError,
@@ -14,7 +14,7 @@ from CasambiBt.errors import (
     BluetoothError,
     ProtocolError,
 )
-
+ 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_PASSWORD
@@ -26,7 +26,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
 )
 from homeassistant.helpers.httpx_client import get_async_client
-
+ 
 from .const import (
     DOMAIN,
     PLATFORMS,
@@ -34,43 +34,43 @@ from .const import (
     RECONNECT_BACKOFF_START,
     RECONNECT_BACKOFF_STEP,
 )
-
+ 
 _LOGGER: Final = logging.getLogger(__name__)
-
-
+ 
+ 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Casambi Bluetooth from a config entry."""
     api = CasambiApi(hass, entry, entry.data[CONF_ADDRESS], entry.data[CONF_PASSWORD])
     await api.connect()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = api
-
+ 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
+ 
     return True
-
-
+ 
+ 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
+ 
     casa_api: CasambiApi = hass.data[DOMAIN][entry.entry_id]
     await casa_api.disconnect()
-
+ 
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
-
+ 
     return unload_ok
-
-
+ 
+ 
 def get_cache_dir(hass: HomeAssistant) -> Path:
     """Return the cache dir that should be used by CasambiBt."""
     conf_path = Path(hass.config.config_dir)
     return conf_path / ".storage" / DOMAIN
-
-
+ 
+ 
 class CasambiApi:
     """Defines a Casambi API."""
-
+ 
     def __init__(
         self,
         hass: HomeAssistant,
@@ -79,18 +79,18 @@ class CasambiApi:
         password: str,
     ) -> None:
         """Initialize a Casambi API."""
-
+ 
         self.hass = hass
         self.conf_entry = conf_entry
         self.address = address
         self.password = password
         self._casa = Casambi(get_async_client(hass), get_cache_dir(hass))
         self.casa = cast(Casambi, CasambiProxy(self, self._casa))
-
+ 
         self._callback_map: dict[int, list[Callable[[Unit], None]]] = {}
         self._cancel_bluetooth_callback: Callable[[], None] | None = None
         self._reconnect_task: asyncio.Task | None = None
-
+ 
     def _register_bluetooth_callback(self) -> None:
         self._cancel_bluetooth_callback = bluetooth.async_register_callback(
             self.hass,
@@ -98,7 +98,7 @@ class CasambiApi:
             {"address": self.address, "connectable": True},
             bluetooth.BluetoothScanningMode.ACTIVE,
         )
-
+ 
     async def connect(self) -> None:
         """Connect initially to the Casmabi network."""
         try:
@@ -107,10 +107,15 @@ class CasambiApi:
             )
             if not device:
                 raise BluetoothDeviceNotFoundError  # noqa: TRY301
-
+ 
             self._casa.registerDisconnectCallback(self._casa_disconnect)
             self._casa.registerUnitChangedHandler(self._unit_changed_handler)
-
+ 
+            # Switch (wall/wireless button) events. Guarded so that the
+            # integration still loads against library versions without it.
+            if hasattr(self._casa, "registerSwitchEventHandler"):
+                self._casa.registerSwitchEventHandler(self._switch_event_handler)
+ 
             await self._casa.connect(device, self.password)
         except BluetoothError as err:
             raise ConfigEntryNotReady("Failed to use bluetooth") from err
@@ -126,12 +131,12 @@ class CasambiApi:
             raise ConfigEntryError(
                 f"Unexpected error creating network {self.address}"
             ) from err
-
+ 
         # Only register bluetooth callback after connection.
         # Otherwise we get an immediate callback and attempt two connections at once.
         if not self._cancel_bluetooth_callback:
             self._register_bluetooth_callback()
-
+ 
     async def reconnect(self) -> None:
         """Start reconnection attempt to the Casmabi network."""
         backoff = RECONNECT_BACKOFF_START
@@ -143,7 +148,7 @@ class CasambiApi:
                 )
                 if not device:
                     raise BluetoothDeviceNotFoundError  # noqa: TRY301
-
+ 
                 await self._casa.reconnect(device)
                 protocol_error = False
                 break
@@ -170,38 +175,38 @@ class CasambiApi:
                     raise HomeAssistantError from err
             except Exception as err:  # pylint: disable=broad-except
                 raise HomeAssistantError from err
-
+ 
             await asyncio.sleep(backoff)
             backoff = min(RECONNECT_BACKOFF_MAX, backoff * RECONNECT_BACKOFF_STEP)
-
+ 
     @property
     def available(self) -> bool:
         """Return True if the controller is available."""
         return self._casa.connected
-
+ 
     def get_units(
         self, control_types: list[UnitControlType] | None = None
     ) -> Iterable[Unit]:
         """Return all units in the network optionally filtered by control type."""
-
+ 
         if not control_types:
             return self._casa.units
-
+ 
         return filter(
             lambda u: any(uc.type in control_types for uc in u.unitType.controls),  # type: ignore[arg-type]
             self._casa.units,
         )
-
+ 
     def get_groups(self) -> Iterable[Group]:
         """Return all groups in the network."""
-
+ 
         return self._casa.groups
-
+ 
     def get_scenes(self) -> Iterable[Scene]:
         """Return all scenes in the network."""
-
+ 
         return self._casa.scenes
-
+ 
     async def disconnect(self) -> None:
         """Disconnects from the controller and disables automatic reconnect."""
         if (
@@ -222,48 +227,77 @@ class CasambiApi:
                 _LOGGER.debug(
                     "Got exception when cancelling reconnect. Ignoring.", exc_info=True
                 )
-
+ 
         if self._cancel_bluetooth_callback is not None:
             self._cancel_bluetooth_callback()
             self._cancel_bluetooth_callback = None
-
+ 
         # This needs to happen before we disconnect.
         # We don't want to be informed about disconnects initiated by us.
         self._casa.unregisterDisconnectCallback(self._casa_disconnect)
-
+ 
         try:
             await self._casa.disconnect()
         except Exception:
             _LOGGER.exception("Error during disconnect.")
         self._casa.unregisterUnitChangedHandler(self._unit_changed_handler)
-
+ 
+        if hasattr(self._casa, "unregisterSwitchEventHandler"):
+            try:
+                self._casa.unregisterSwitchEventHandler(self._switch_event_handler)
+            except ValueError:
+                # Never registered because connect() failed early. Nothing to do.
+                pass
+ 
+    @callback
+    def _switch_event_handler(self, event: Any) -> None:
+        """Forward a Casambi switch event to the Home Assistant event bus.
+ 
+        Fires ``casambi_bt_switch_event``. Attributes are read defensively so
+        that the handler survives changes to the library's SwitchEvent shape.
+        """
+        action = getattr(event, "event", None)
+        self.hass.bus.async_fire(
+            f"{DOMAIN}_switch_event",
+            {
+                "entry_id": self.conf_entry.entry_id,
+                "unit_id": getattr(event, "unit_id", None),
+                "button": getattr(event, "button", None),
+                "button_event_index": getattr(event, "button_event_index", None),
+                # PRESS / RELEASE / HOLD / RELEASE_AFTER_HOLD / UNKNOWN
+                "action": getattr(action, "name", None) or str(action),
+                "target_type": getattr(event, "target_type", None),
+                "flags": getattr(event, "flags", None),
+            },
+        )
+ 
     @callback
     def _casa_disconnect(self) -> None:
         self._schedule_reconnect()
-
+ 
     def register_unit_updates(self, unit: Unit, c: Callable[[Unit], None]) -> None:
         """Register a callback for unit updates.
-
+ 
         :param unit: The unit for which changes should be reported.
         :param c: The callback.
         """
         self._callback_map.setdefault(unit.deviceId, []).append(c)
-
+ 
     def unregister_unit_updates(self, unit: Unit, c: Callable[[Unit], None]) -> None:
         """Unregister a callback for unit updates.
-
+ 
         :param unit: The unit for which changes should no longer be reported.
         :param c: The callback.
         """
         self._callback_map[unit.deviceId].remove(c)
-
+ 
     @callback
     def _unit_changed_handler(self, unit: Unit) -> None:
         if unit.deviceId not in self._callback_map:
             return
         for c in self._callback_map[unit.deviceId]:
             c(unit)
-
+ 
     @callback
     def _bluetooth_callback(
         self,
@@ -272,7 +306,7 @@ class CasambiApi:
     ) -> None:
         if not self._casa.connected and service_info.connectable:
             self._schedule_reconnect()
-
+ 
     def _schedule_reconnect(self) -> None:
         # We assume that a reconnect task is only cancelled when disconnected.
         # So never reconnect when the disconnect task has been cancelled.
@@ -285,22 +319,22 @@ class CasambiApi:
             self._reconnect_task = self.conf_entry.async_create_background_task(
                 self.hass, self.reconnect(), "Reconnect"
             )
-
-
+ 
+ 
 class CasambiProxy:
     """Proxy the write operations so that bluetooth errors automatically trigger a reconnect."""
-
+ 
     def __init__(self, api: CasambiApi, casa: Casambi) -> None:
         """Initialize a CasambiProxy."""
         self._api = api
         self._casa = casa
-
+ 
     def __getattr__(self, name: str) -> Any:
         """Wrap all async calls to drop BluetoothError and trigger a reconnect instead."""
         attr = getattr(self._casa, name)
-
+ 
         if inspect.iscoroutinefunction(attr):
-
+ 
             async def async_wrapper(*args, **kwargs):
                 try:
                     return await attr(*args, **kwargs)
@@ -308,7 +342,8 @@ class CasambiProxy:
                     _LOGGER.debug("Bluetooth error during write.", exc_info=True)
                     _LOGGER.info("Triggering reconnect after write failed.")
                     self._api._schedule_reconnect()  # noqa: SLF001
-
+ 
             return async_wrapper
-
+ 
         return attr
+ 
