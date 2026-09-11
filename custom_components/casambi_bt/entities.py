@@ -46,6 +46,54 @@ class CasambiEntity(Entity, metaclass=ABCMeta):
         """Return True if entity is available."""
         return self._api.available
 
+    @property
+    def _network_identifier(self) -> tuple[str, str]:
+        """Return the device registry identifier of the network device."""
+        return (DOMAIN, self._api.casa.networkId)
+
+    @property
+    def _network_device_info(self) -> DeviceInfo:
+        """Return the device info of the network device.
+
+        Single source of truth: the network entities publish this as their own
+        device info, and unit entities use it to create the device on demand
+        when they need its registry id as a via device.
+        """
+        return DeviceInfo(
+            name=self._api.casa.networkName,
+            manufacturer="Casambi",
+            model="Network",
+            identifiers={self._network_identifier},
+            connections={(device_registry.CONNECTION_BLUETOOTH, self._api.address)},
+        )
+
+    def _network_device_id(self) -> str:
+        """Return the registry id of the network device, creating it if needed.
+
+        Units are linked to the network device with `via_device_id`. The older
+        `via_device` (an identifier tuple) must not be used: it is deprecated, and
+        inside a `DeviceInfo` it is fatal from HA 2026.9 on. The registry call is
+        then made by HA's own entity_platform from a task, so `report_usage` finds
+        no integration frame on the stack, falls back to the core behaviour and
+        raises RuntimeError instead of logging a warning -- no entity gets added.
+        Resolving the id here keeps the call inside this integration.
+
+        The platforms are set up concurrently, so a unit platform may run before
+        the network device has been registered by a network entity. Create it on
+        demand in that case so the link never dangles.
+        """
+        entry_id = self._api.conf_entry.entry_id
+        dev_reg = device_registry.async_get(self._api.hass)
+        if (
+            entry := dev_reg.async_get_device_by_identifier(
+                self._network_identifier, entry_id
+            )
+        ) is not None:
+            return entry.id
+        return dev_reg.async_get_or_create(
+            config_entry_id=entry_id, **self._network_device_info
+        ).id
+
     @callback
     def _change_callback(self, _unit: CasambiUnit) -> None:
         self.schedule_update_ha_state(False)
@@ -78,13 +126,7 @@ class CasambiNetworkEntity(CasambiEntity, metaclass=ABCMeta):
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information about this Casambi entity."""
-        return DeviceInfo(
-            name=self._api.casa.networkName,
-            manufacturer="Casambi",
-            model="Network",
-            identifiers={(DOMAIN, self._api.casa.networkId)},
-            connections={(device_registry.CONNECTION_BLUETOOTH, self._api.address)},
-        )
+        return self._network_device_info
 
 
 class CasambiNetworkGroup(CasambiNetworkEntity, metaclass=ABCMeta):
@@ -166,7 +208,7 @@ class CasambiUnitEntity(CasambiEntity, metaclass=ABCMeta):
             model=unit.unitType.model,
             sw_version=unit.firmwareVersion,
             identifiers={(DOMAIN, unit.uuid)},
-            via_device=(DOMAIN, self._api.casa.networkId),
+            via_device_id=self._network_device_id(),
         )
 
     @property
