@@ -16,6 +16,7 @@ from homeassistant.components.light import (
     ColorMode,
     LightEntity,
     LightEntityFeature,
+    filter_supported_color_modes,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -244,6 +245,12 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
         supported_modes.discard(ColorMode.UNKNOWN)
         if len(supported_modes) == 0:
             supported_modes.add(ColorMode.BRIGHTNESS)
+        # A group can mix unit types, e.g. a dimmer (BRIGHTNESS) with a
+        # tunable-white unit (COLOR_TEMP). Home Assistant only accepts
+        # BRIGHTNESS or ONOFF on their own, so the raw union would be
+        # rejected and the group entity never created. Let HA reduce the
+        # set: every remaining color mode already implies brightness.
+        supported_modes = filter_supported_color_modes(supported_modes)
         self._attr_supported_color_modes = supported_modes
  
         desc = TypedEntityDescription(
