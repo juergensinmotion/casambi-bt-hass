@@ -1,0 +1,48 @@
+From 75b36ef3a1453eb092e7384340f8607af6e28d89 Mon Sep 17 00:00:00 2001
+From: juergensinmotion <129845674+juergensinmotion@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 08:52:09 +0000
+Subject: [PATCH] Fix invalid supported color modes for mixed light groups
+
+A group combining a dimmer-only unit (BRIGHTNESS) with a tunable-white
+unit (COLOR_TEMP) produced the union {BRIGHTNESS, COLOR_TEMP}, which
+Home Assistant rejects: BRIGHTNESS and ONOFF are only valid on their
+own. The group entity was never created ("Error adding entity None").
+
+Reduce the union with Home Assistant's own filter_supported_color_modes().
+Every remaining mode already implies brightness, so dimming the group
+keeps working.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01G145QQ7kohntbdtGMw7TY9
+---
+ custom_components/casambi_bt/light.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/custom_components/casambi_bt/light.py b/custom_components/casambi_bt/light.py
+index d2607d3..febc964 100644
+--- a/custom_components/casambi_bt/light.py
++++ b/custom_components/casambi_bt/light.py
+@@ -16,6 +16,7 @@ from homeassistant.components.light import (
+     ColorMode,
+     LightEntity,
+     LightEntityFeature,
++    filter_supported_color_modes,
+ )
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.core import HomeAssistant
+@@ -244,6 +245,12 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
+         supported_modes.discard(ColorMode.UNKNOWN)
+         if len(supported_modes) == 0:
+             supported_modes.add(ColorMode.BRIGHTNESS)
++        # A group can mix unit types, e.g. a dimmer (BRIGHTNESS) with a
++        # tunable-white unit (COLOR_TEMP). Home Assistant only accepts
++        # BRIGHTNESS or ONOFF on their own, so the raw union would be
++        # rejected and the group entity never created. Let HA reduce the
++        # set: every remaining color mode already implies brightness.
++        supported_modes = filter_supported_color_modes(supported_modes)
+         self._attr_supported_color_modes = supported_modes
+  
+         desc = TypedEntityDescription(
+-- 
+2.43.0
+

@@ -1,0 +1,143 @@
+From d6a668f4697724a00d3ab1edb4b8d02cd883a56f Mon Sep 17 00:00:00 2001
+From: Michael Juergens <mjuergens@motion-ray.com>
+Date: Fri, 11 Sep 2026 13:31:04 +0000
+Subject: [PATCH] =?UTF-8?q?fix(device=5Fregistry):=20link=20units=20by=20r?=
+ =?UTF-8?q?egistry=20id=20=E2=80=94=20no=20entities=20on=20HA=202026.9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CasambiUnitEntity published via_device=(DOMAIN, networkId) in its DeviceInfo.
+From HA 2026.9 that is fatal rather than merely deprecated: the integration
+only returns the dict, the actual async_get_or_create call is made by HA's own
+entity_platform from the task started by the non-awaited async_add_entities().
+No custom_components frame is left on the stack, so report_usage raises
+MissingIntegrationFrame, falls back to core_behavior=ERROR and raises
+RuntimeError instead of logging the promised warning. Symptom would be
+hundreds of 'Error adding entity None for domain light' and no lights at all.
+Same failure mode as SukramJ/homematicip_local@3d4d691 and hikvision_next.
+
+Units are now linked by via_device_id:
+
+- _network_device_id() resolves the network device via
+  async_get_device_by_identifier(), scoped to this config entry, and creates it
+  on demand if a unit platform was set up before a network entity registered it
+  (the platforms are forwarded concurrently), so the link never dangles
+- _network_device_info is now the single source of truth for the network
+  device, published by CasambiNetworkEntity and reused for that on-demand
+  creation, so the two cannot drift apart
+
+Note that via_device is no longer part of the DeviceInfo TypedDict either, so
+the old call was already type-incorrect.
+
+async_get_device_by_identifier() requires HA 2026.8, hence the new minimum in
+hacs.json.
+
+Existing devices keep their stored link during the upgrade: an omitted
+via_device_id stays UNDEFINED and _async_update_device only writes values that
+are not UNDEFINED.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NpjEfBLBcNc7R2Nrxt4GhN
+---
+ custom_components/casambi_bt/entities.py | 58 ++++++++++++++++++++----
+ hacs.json                                |  3 +-
+ 2 files changed, 52 insertions(+), 9 deletions(-)
+
+diff --git a/custom_components/casambi_bt/entities.py b/custom_components/casambi_bt/entities.py
+index c109c47..14f9c59 100644
+--- a/custom_components/casambi_bt/entities.py
++++ b/custom_components/casambi_bt/entities.py
+@@ -46,6 +46,54 @@ class CasambiEntity(Entity, metaclass=ABCMeta):
+         """Return True if entity is available."""
+         return self._api.available
+ 
++    @property
++    def _network_identifier(self) -> tuple[str, str]:
++        """Return the device registry identifier of the network device."""
++        return (DOMAIN, self._api.casa.networkId)
++
++    @property
++    def _network_device_info(self) -> DeviceInfo:
++        """Return the device info of the network device.
++
++        Single source of truth: the network entities publish this as their own
++        device info, and unit entities use it to create the device on demand
++        when they need its registry id as a via device.
++        """
++        return DeviceInfo(
++            name=self._api.casa.networkName,
++            manufacturer="Casambi",
++            model="Network",
++            identifiers={self._network_identifier},
++            connections={(device_registry.CONNECTION_BLUETOOTH, self._api.address)},
++        )
++
++    def _network_device_id(self) -> str:
++        """Return the registry id of the network device, creating it if needed.
++
++        Units are linked to the network device with `via_device_id`. The older
++        `via_device` (an identifier tuple) must not be used: it is deprecated, and
++        inside a `DeviceInfo` it is fatal from HA 2026.9 on. The registry call is
++        then made by HA's own entity_platform from a task, so `report_usage` finds
++        no integration frame on the stack, falls back to the core behaviour and
++        raises RuntimeError instead of logging a warning -- no entity gets added.
++        Resolving the id here keeps the call inside this integration.
++
++        The platforms are set up concurrently, so a unit platform may run before
++        the network device has been registered by a network entity. Create it on
++        demand in that case so the link never dangles.
++        """
++        entry_id = self._api.conf_entry.entry_id
++        dev_reg = device_registry.async_get(self._api.hass)
++        if (
++            entry := dev_reg.async_get_device_by_identifier(
++                self._network_identifier, entry_id
++            )
++        ) is not None:
++            return entry.id
++        return dev_reg.async_get_or_create(
++            config_entry_id=entry_id, **self._network_device_info
++        ).id
++
+     @callback
+     def _change_callback(self, _unit: CasambiUnit) -> None:
+         self.schedule_update_ha_state(False)
+@@ -78,13 +126,7 @@ class CasambiNetworkEntity(CasambiEntity, metaclass=ABCMeta):
+     @property
+     def device_info(self) -> DeviceInfo:
+         """Return device information about this Casambi entity."""
+-        return DeviceInfo(
+-            name=self._api.casa.networkName,
+-            manufacturer="Casambi",
+-            model="Network",
+-            identifiers={(DOMAIN, self._api.casa.networkId)},
+-            connections={(device_registry.CONNECTION_BLUETOOTH, self._api.address)},
+-        )
++        return self._network_device_info
+ 
+ 
+ class CasambiNetworkGroup(CasambiNetworkEntity, metaclass=ABCMeta):
+@@ -166,7 +208,7 @@ class CasambiUnitEntity(CasambiEntity, metaclass=ABCMeta):
+             model=unit.unitType.model,
+             sw_version=unit.firmwareVersion,
+             identifiers={(DOMAIN, unit.uuid)},
+-            via_device=(DOMAIN, self._api.casa.networkId),
++            via_device_id=self._network_device_id(),
+         )
+ 
+     @property
+diff --git a/hacs.json b/hacs.json
+index 07a9c4b..9fdf152 100644
+--- a/hacs.json
++++ b/hacs.json
+@@ -1,4 +1,5 @@
+ {
+     "name": "Casambi Bluetooth",
+-    "render_readme": true
++    "render_readme": true,
++    "homeassistant": "2026.8.0"
+ }
+-- 
+2.43.0
+
