@@ -88,6 +88,7 @@ class CasambiApi:
         self.casa = cast(Casambi, CasambiProxy(self, self._casa))
  
         self._callback_map: dict[int, list[Callable[[Unit], None]]] = {}
+        self._switch_listeners: dict[int, list[Callable[[Any], None]]] = {}
         self._cancel_bluetooth_callback: Callable[[], None] | None = None
         self._reconnect_task: asyncio.Task | None = None
  
@@ -257,6 +258,9 @@ class CasambiApi:
         that the handler survives changes to the library's SwitchEvent shape.
         """
         action = getattr(event, "event", None)
+        unit_id = getattr(event, "unit_id", None)
+        for listener in list(self._switch_listeners.get(unit_id, ())):
+            listener(event)
         self.hass.bus.async_fire(
             f"{DOMAIN}_switch_event",
             {
@@ -275,6 +279,20 @@ class CasambiApi:
     def _casa_disconnect(self) -> None:
         self._schedule_reconnect()
  
+    def register_switch_listener(
+        self, unit_id: int, c: Callable[[Any], None]
+    ) -> None:
+        """Register a callback for switch events of one unit (by deviceId)."""
+        self._switch_listeners.setdefault(unit_id, []).append(c)
+
+    def unregister_switch_listener(
+        self, unit_id: int, c: Callable[[Any], None]
+    ) -> None:
+        """Unregister a callback for switch events of one unit."""
+        listeners = self._switch_listeners.get(unit_id, [])
+        if c in listeners:
+            listeners.remove(c)
+
     def register_unit_updates(self, unit: Unit, c: Callable[[Unit], None]) -> None:
         """Register a callback for unit updates.
  
